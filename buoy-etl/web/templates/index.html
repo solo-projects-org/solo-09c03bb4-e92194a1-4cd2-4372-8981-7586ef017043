@@ -77,7 +77,7 @@
     </div>
     <p class="hint">窗口语义为 <code>[start, end)</code>；日档列：<code>utc_second / temperature_c / salinity_psu</code>。</p>
     <div style="display:flex; gap:10px; flex-wrap:wrap;">
-      <button id="go">开始查询并流式下载 CSV</button>
+      <button id="go">开始查询并下载 CSV</button>
       <button id="demo" class="ghost">填入演示窗口（首小时）</button>
     </div>
     <progress id="prog" value="0" max="100" hidden></progress>
@@ -179,18 +179,18 @@ $("go").onclick = async () => {
 
   const btn = $("go"); btn.disabled = true;
   const prog = $("prog"); prog.hidden = false; prog.value = 0;
-  msg("info", "请求中：先固定源端强 ETag，再按全长预留缓存空间…");
+  msg("info", "请求中：先固定源端强 ETag，再按全长预留缓存空间；服务端完整生成 CSV 后才开始下载…");
   try {
     const resp = await fetch(`/api/query?key=${encodeURIComponent(key)}&start=${start}&end=${end}`);
     if (!resp.ok) {
       let detail = "HTTP " + resp.status;
       try { detail = (await resp.json()).detail || detail; } catch (_) {}
       const kind = resp.status === 503 ? "warn" : "err";
-      msg(kind, `请求未成功（${resp.status}）：\n${detail}`);
+      msg(kind, `请求未成功（${resp.status}），未生成 CSV：\n${detail}`);
       prog.hidden = true;
       return;
     }
-    // 流式接收，展示下载进度（含取档等待 + CSV 生成）。
+    // 服务端已完整生成才返回 200；这里按 Content-Length 展示进度并分块接收。
     const total = Number(resp.headers.get("content-length")) || 0;
     const reader = resp.body.getReader();
     const chunks = []; let got = 0;
@@ -200,6 +200,7 @@ $("go").onclick = async () => {
       chunks.push(value); got += value.length;
       if (total) prog.value = Math.min(99, got / total * 100);
     }
+    if (total && got !== total) throw new Error(`响应不完整：收到 ${got}/${total} 字节`);
     const blob = new Blob(chunks, { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");

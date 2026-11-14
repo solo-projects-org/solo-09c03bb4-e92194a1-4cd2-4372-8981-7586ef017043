@@ -246,6 +246,34 @@ def test_slow_download_does_not_block_other_days(slow_object_source, object_dir,
     asyncio.run(scenario())
 
 
+def test_stream_aborts_at_batch_boundary(object_source, cache_paths):
+    """``should_abort`` 在每个批次之间生效，并抛 ``QueryAborted``（不留半份输出）。"""
+    from web.query import QueryAborted, stream_filtered_csv
+
+    base_url, _ = object_source
+
+    async def scenario():
+        mgr = _manager(base_url, cache_paths, 10 * 1024 * 1024)
+        await mgr.start()
+        try:
+            etag, size = await mgr.head_etag("day1.parquet")
+            lease = await mgr.ensure("day1.parquet", etag, size)
+        finally:
+            await mgr.close()
+        return lease.path
+
+    path = asyncio.run(scenario())
+    chunks = []
+    with pytest.raises(QueryAborted):
+        for chunk in stream_filtered_csv(
+            path, DAY_START, DAY_START + 86400,
+            batch_size=256, should_abort=lambda: len(chunks) >= 1,
+        ):
+            chunks.append(chunk)
+    # 中止前只产生了少量块；调用方据此丢弃，不会把半份 CSV 交付。
+    assert chunks
+
+
 def test_parquet_filter_pushdown_matches_full_scan(object_source, cache_paths):
     base_url, _ = object_source
     async def scenario():

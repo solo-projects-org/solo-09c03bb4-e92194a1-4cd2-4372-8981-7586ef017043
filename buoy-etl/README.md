@@ -1,13 +1,15 @@
 # 浮标温盐观测提取平台（岸站对象库 → 离线质控）
 
 海洋数据员从岸站对象库选取**一份日 Parquet**和一个 **UTC 秒时间窗**，
-平台按版本固定取档、跨进程共享磁盘缓存，并以 **PyArrow 分批筛取 + 流式 CSV**
-把窗口内的温度/盐度观测交给离线质控。
+平台按版本固定取档、跨进程共享磁盘缓存，并以 **PyArrow 分批筛取 + 低内存分块交付**
+把窗口内的温度/盐度观测以 CSV 交给离线质控。
 
 - 时间窗语义：**`[start, end)`，含起点、不含终点**。
 - 日档固定三列：`utc_second`（UTC 秒，int64）、`temperature_c`、`salinity_psu`。
 - 两个 Web 进程通过 **SQLite（WAL + 显式写事务）** 协调同一份共享磁盘缓存。
 - 缓存口径：**下载预留 + 完整缓存合计上限 64 MiB**，单档超上限直接拒绝。
+- 交付口径：**整窗读取并编码成功后才发 200 附件**；缺列或任一读取批次失败
+  返回明确的 JSON 错误，绝不交付半份 CSV 或伪装成附件的“查询失败”。
 
 ## 架构
 
@@ -42,8 +44,10 @@
 | 查询结束/断开释放占用，其他读者照常 | 每次查询一个 lease（`cache_leases` 表），生成器 `finally` 必释放；带心跳，僵死 lease 由 reaper 回收 |
 | 慢源/慢下载不堵其他日档 | 阻塞 IO 全部 `asyncio.to_thread`；等待按 (key, etag) 隔离；PyArrow 批次逐块回到事件环 |
 | 下载失败先删残件再释放预留 | `fail_download` 先 `unlink` 临时文件再删下载行；临时文件同目录 `fsync + rename`，读者只见完整文件 |
+| 失败不交付半份 CSV | 整个时间窗先写入本请求专属临时文件，全部批次成功后才发 200 附件；缺列 → 422、读取/编码失败 → 500（JSON） |
+| 失败/断连清理本次临时输出 | `_spool_window_csv` 失败即删半成品；交付结束或浏览器断开由 `deliver()`/`BackgroundTask` 删整个 spool 目录 |
 | 崩溃兜底 | 下载行/lease 带 owner + heartbeat；任意存活进程的 reaper 清理僵死行与残件 |
-| PyArrow 分批筛取 + 流式 CSV | `web/query.py` 用 Dataset scanner 做行组统计下推，逐批 `write_csv` 产出字节块 |
+| PyArrow 分批筛取 + 低内存交付 | `web/query.py` 用 Dataset scanner 做行组统计下推，逐批 `write_csv`；`web/app.py` 以 64 KiB 块回送并带 `Content-Length` |
 
 ## 一键启动（Docker Compose）
 
@@ -54,7 +58,7 @@ docker compose up --build
 
 | 入口 | 地址 | 说明 |
 | --- | --- | --- |
-| 网页（经 nginx 轮询两个 Web 进程） | http://localhost:8090 | 选日档、填 UTC 秒窗口、流式下载、实时缓存面板 |
+| 网页（经 nginx 轮询两个 Web 进程） | http://localhost:8090 | 选日档、填 UTC 秒窗口、下载 CSV、实时缓存面板 |
 | Web 进程直连 | http://localhost:8001 / http://localhost:8002 | 响应头 `X-Served-By` 标识实际实例 |
 | 本地对象源 | http://localhost:8080/objects | 日档清单（ETag、全长、当日 UTC 范围） |
 
@@ -81,8 +85,8 @@ SQLITE_PATH=./sample_data/cache/c.db CACHE_DIR=./sample_data/cache/files \
 OBJECT_SOURCE_URL=http://127.0.0.1:8080 PROCESS_LABEL=web-1 \
 python -m uvicorn web.app:app --port 8001
 
-# 测试（30 个用例：协调层、端到端、HTTP、对象源）
-python -m pytest --timeout=120
+# 测试（协调层、端到端、HTTP、对象源、交付语义）
+python3 -m pytest --timeout=120
 ```
 
 ## 三个演示场景
@@ -131,6 +135,22 @@ python scripts/simulate_source.py --key $KEY --fail-after 1024
 python scripts/simulate_source.py --key $KEY --clear   # 清除注入
 ```
 
+### 附加：交付失败与断连（不产生半份 CSV）
+
+```bash
+# 日档缺 salinity_psu：422 JSON，响应里没有 Content-Disposition，不下载任何附件
+curl -si "http://localhost:8090/api/query?key=BAD.parquet&start=$S&end=$E"
+
+# 行组损坏（可把缓存里对应 .parquet 的某个行组数据页改坏后查询整天窗口）：
+# 500 JSON「读取或编码窗口数据失败，未生成 CSV」，客户端一个 CSV 字节都收不到。
+
+# 浏览器中途关闭连接：Web 进程在下一个批次边界中止，删除本次临时输出、
+# 释放 lease；同一日档的其他查询不受影响。
+```
+
+成功响应的约定：`200` + `Content-Disposition: attachment` +
+`Content-Length`（完整 CSV 字节数）+ 强 `ETag` / `X-Cache-ETag`（本次固定版本）。
+
 ## 目录结构
 
 ```
@@ -139,13 +159,13 @@ buoy-etl/
 │   ├── coordination.py   # SQLite 账本：预留/淘汰/lease/reaper（跨进程互斥）
 │   └── manager.py        # ETag 固定、下载协调、等待与失败清理
 ├── web/
-│   ├── app.py            # FastAPI：查询接口、流式响应、断开检测、503/409/502 映射
-│   ├── query.py          # PyArrow scanner 分批筛取 [start,end) + CSV 流式输出
+│   ├── app.py            # FastAPI：整窗生成→成功才发附件；错误映射；断开检测与临时输出清理
+│   ├── query.py          # PyArrow scanner 分批筛取 [start,end) + 可中止的 CSV 编码
 │   └── templates/index.html  # 可操作网页（选档/窗口/下载/缓存面板）
 ├── object_source/server.py   # 纯标准库 HTTP 对象源（强 ETag、注入、原子更正）
 ├── scripts/              # 样例生成、更正、故障注入
-├── nginx/nginx.conf      # 轮询 + 关闭代理缓冲（保证流式）
-├── tests/                # 30 个 pytest 用例
+├── nginx/nginx.conf      # 轮询 + 关闭代理缓冲（保证分块下发不被攒住）
+├── tests/                # pytest 用例（含交付失败/断连语义）
 ├── Dockerfile / docker-compose.yml
 └── requirements.txt
 ```
@@ -154,7 +174,11 @@ buoy-etl/
 
 - **预留即占额**：下载行在创建时就按源端 `Content-Length` 计入总量，杜绝“下到一半把缓存撑爆”。
 - **临时文件同目录 `fsync + os.replace`**：缓存目录里永远不存在半成品可读文件。
+- **先完整生成再交付**：查询结果写入本请求专属临时文件（默认系统临时目录，
+  可用 `QUERY_SPOOL_DIR` 指向专用目录），全窗成功后才发 200；读取仍是
+  PyArrow 分批、回送仍是 64 KiB 小块，内存不随窗口增大。
 - **协调只依赖 SQLite**：不引入 Redis 等额外组件；WAL + `BEGIN IMMEDIATE` + `busy_timeout`
   保证两个（及更多）Web 进程互斥，写事务只在预留/转正/淘汰/租用等短操作内持有。
 - **心跳 + reaper 而非分布式锁服务**：进程崩溃后，残件与占用由任意存活进程在 10 秒级回收。
-- **HTTP 语义**：413 单档超限、503 缓存忙、409 版本失配/下载被放弃、502 源端传输失败、404 对象不存在。
+- **HTTP 语义**：200 仅代表完整 CSV；413 单档超限、422 日档缺列、500 读取/编码失败、
+  503 缓存忙、409 版本失配/下载被放弃、502 源端传输失败、404 对象不存在。
