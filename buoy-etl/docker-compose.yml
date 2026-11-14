@@ -1,0 +1,88 @@
+# 两个 Web 进程 + nginx 轮询 + 本地对象源 + 共享磁盘缓存
+# 默认缓存上限 64 MiB（下载预留 + 完整缓存合计）。
+# 演示“缓存满”时可：
+#   CACHE_LIMIT_BYTES=4194304 docker compose up --build
+services:
+  object-source:
+    build: .
+    image: buoy-etl:latest
+    command: ["python", "-m", "object_source.server"]
+    environment:
+      DATA_DIR: /data/objects
+      PORT: "8080"
+    volumes:
+      - object_data:/data/objects
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  sample-init:
+    image: buoy-etl:latest
+    # 生成温盐样例；on-failure 兜底对象源 healthcheck 的启动竞态。
+    restart: on-failure
+    command: ["python", "scripts/generate_samples.py", "--out", "/data/objects", "--days", "4", "--step", "10"]
+    environment:
+      DATA_DIR: /data/objects
+    volumes:
+      - object_data:/data/objects
+    depends_on:
+      object-source:
+        condition: service_healthy
+
+  web1:
+    image: buoy-etl:latest
+    environment:
+      SQLITE_PATH: /data/cache/coordination/cache.db
+      CACHE_DIR: /data/cache/files
+      OBJECT_SOURCE_URL: http://object-source:8080
+      CACHE_LIMIT_BYTES: ${CACHE_LIMIT_BYTES:-67108864}
+      PROCESS_LABEL: web-1
+    volumes:
+      - cache_data:/data/cache
+    depends_on:
+      - object-source
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web2:
+    image: buoy-etl:latest
+    environment:
+      SQLITE_PATH: /data/cache/coordination/cache.db
+      CACHE_DIR: /data/cache/files
+      OBJECT_SOURCE_URL: http://object-source:8080
+      CACHE_LIMIT_BYTES: ${CACHE_LIMIT_BYTES:-67108864}
+      PROCESS_LABEL: web-2
+    volumes:
+      - cache_data:/data/cache
+    depends_on:
+      - object-source
+    ports:
+      - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - web1
+      - web2
+    ports:
+      - "8090:8090"
+
+volumes:
+  object_data:
+  cache_data:

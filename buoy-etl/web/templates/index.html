@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>浮标温盐观测提取 · 离线质控</title>
+<style>
+  :root {
+    --bg: #0f1720; --panel: #182430; --line: #2a3b4d;
+    --fg: #dce6f0; --muted: #8ba0b5; --accent: #38bdf8;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 18px 28px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 14px; }
+  header h1 { font-size: 19px; margin: 0; }
+  header .proc { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; padding: 22px 28px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  .panel h2 { margin: 0 0 14px; font-size: 15px; color: var(--accent); }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 12px; }
+  select, input {
+    width: 100%; padding: 9px 10px; border-radius: 7px;
+    border: 1px solid var(--line); background: #0e1822; color: var(--fg); font-size: 14px;
+  }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  button {
+    margin-top: 16px; padding: 10px 18px; border: 0; border-radius: 7px;
+    background: var(--accent); color: #06222f; font-weight: 600; cursor: pointer; font-size: 14px;
+  }
+  button:disabled { opacity: .5; cursor: wait; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 400; margin-top: 0; padding: 6px 12px; }
+  .msg { margin-top: 14px; padding: 10px 12px; border-radius: 7px; font-size: 13px; white-space: pre-wrap; display: none; }
+  .msg.info { display: block; background: #10324a; color: #b8e3f8; }
+  .msg.ok { display: block; background: #0d3326; color: #a7f3d0; }
+  .msg.err { display: block; background: #3b1418; color: #fecaca; }
+  .msg.warn { display: block; background: #3a2c0d; color: #fde68a; }
+  .bar { height: 10px; border-radius: 5px; background: #0e1822; overflow: hidden; border: 1px solid var(--line); }
+  .bar > i { display: block; height: 100%; background: var(--ok); transition: width .3s; }
+  .bar > i.hot { background: var(--warn); }
+  .bar > i.full { background: var(--err); }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  .tag { padding: 1px 8px; border-radius: 99px; font-size: 11px; }
+  .tag.complete { background: #0d3326; color: var(--ok); }
+  .tag.downloading { background: #3a2c0d; color: var(--warn); }
+  code { color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .topline { display: flex; justify-content: space-between; align-items: center; }
+  progress { width: 100%; height: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>浮标温盐观测提取</h1>
+  <span class="proc">后端实例：<code>{{ process_label }}</code> · 缓存上限 {{ "%.1f"|format(limit_mib) }} MiB（下载预留 + 完整缓存合计）</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>① 选择日档与 UTC 秒时间窗</h2>
+    <label for="key">日 Parquet（岸站对象库）</label>
+    <select id="key"></select>
+    <div class="row2">
+      <div>
+        <label for="start">起点 UTC 秒（含）</label>
+        <input id="start" type="number" placeholder="例如 1735689600" />
+      </div>
+      <div>
+        <label for="end">终点 UTC 秒（不含）</label>
+        <input id="end" type="number" placeholder="例如 1735693200" />
+      </div>
+    </div>
+    <p class="hint">窗口语义为 <code>[start, end)</code>；日档列：<code>utc_second / temperature_c / salinity_psu</code>。</p>
+    <div style="display:flex; gap:10px; flex-wrap:wrap;">
+      <button id="go">开始查询并流式下载 CSV</button>
+      <button id="demo" class="ghost">填入演示窗口（首小时）</button>
+    </div>
+    <progress id="prog" value="0" max="100" hidden></progress>
+    <div id="msg" class="msg"></div>
+  </section>
+
+  <section class="panel">
+    <div class="topline">
+      <h2>② 共享磁盘缓存状态（SQLite 协调）</h2>
+      <button id="refresh" class="ghost">刷新</button>
+    </div>
+    <div id="usage" class="hint"></div>
+    <div class="bar" style="margin-top:8px;"><i id="barfill"></i></div>
+    <table>
+      <thead>
+        <tr><th>日档</th><th>状态</th><th>大小</th><th>租用数</th><th>持有者</th><th>ETag</th></tr>
+      </thead>
+      <tbody id="cachebody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody>
+    </table>
+    <p class="hint">「租用数」即正在查询的读者数；只有租用数为 0 的完整文件可被 LRU 淘汰。</p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const msg = (kind, text) => { const el = $("msg"); el.className = "msg " + kind; el.textContent = text; };
+const fmtBytes = (n) => {
+  if (n < 1024) return n + " B";
+  const u = ["KiB", "MiB", "GiB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(2) + " " + u[i];
+};
+
+async function loadCatalog() {
+  try {
+    const r = await fetch("/api/catalog");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const items = await r.json();
+    const sel = $("key");
+    sel.innerHTML = "";
+    items.forEach((it) => {
+      const o = document.createElement("option");
+      o.value = it.key;
+      o.textContent = `${it.key}  (${fmtBytes(it.size)}, ETag ${it.etag.slice(0, 14)}…)`;
+      o.dataset.start = it.day_start_utc;
+      o.dataset.end = it.day_end_utc;
+      sel.appendChild(o);
+    });
+    if (items.length) msg("info", "已加载 " + items.length + " 份日档。");
+  } catch (e) {
+    msg("err", "日档清单加载失败：" + e);
+  }
+}
+
+async function loadCache() {
+  try {
+    const r = await fetch("/api/cache");
+    const s = await r.json();
+    const pct = s.limit_bytes ? (s.total_bytes / s.limit_bytes * 100) : 0;
+    $("usage").innerHTML =
+      `已用 <b>${fmtBytes(s.total_bytes)}</b> / ${fmtBytes(s.limit_bytes)}（${pct.toFixed(1)}%）· 活跃租用 ${s.lease_count} · 服务实例 <code>${s.served_by}</code>`;
+    const fill = $("barfill");
+    fill.style.width = Math.min(100, pct) + "%";
+    fill.className = pct >= 100 ? "full" : (pct >= 80 ? "hot" : "");
+    const body = $("cachebody");
+    if (!s.entries.length) {
+      body.innerHTML = '<tr><td colspan="6" class="hint">缓存为空，发起一次查询即可触发下载。</td></tr>';
+    } else {
+      body.innerHTML = s.entries.map((e) => `
+        <tr>
+          <td><code>${e.key}</code></td>
+          <td><span class="tag ${e.state}">${e.state === "complete" ? "完整" : "下载中"}</span></td>
+          <td>${fmtBytes(e.size)}</td>
+          <td>${e.leases}</td>
+          <td>${e.owner ? e.owner.split(":").slice(0, 2).join(":") : "—"}</td>
+          <td><code>${e.etag.slice(0, 14)}…</code></td>
+        </tr>`).join("");
+    }
+  } catch (e) { /* 轮询失败静默 */ }
+}
+
+$("demo").onclick = () => {
+  const opt = $("key").selectedOptions[0];
+  if (!opt) return;
+  $("start").value = opt.dataset.start;
+  $("end").value = String(Number(opt.dataset.start) + 3600);
+};
+
+$("refresh").onclick = () => loadCache();
+
+$("go").onclick = async () => {
+  const key = $("key").value;
+  const start = Number($("start").value);
+  const end = Number($("end").value);
+  if (!key || !Number.isFinite(start) || !Number.isFinite(end)) {
+    msg("err", "请选择日档并填写合法的 UTC 秒起止值。"); return;
+  }
+  if (end <= start) { msg("err", "时间窗非法：要求 start < end。"); return; }
+
+  const btn = $("go"); btn.disabled = true;
+  const prog = $("prog"); prog.hidden = false; prog.value = 0;
+  msg("info", "请求中：先固定源端强 ETag，再按全长预留缓存空间…");
+  try {
+    const resp = await fetch(`/api/query?key=${encodeURIComponent(key)}&start=${start}&end=${end}`);
+    if (!resp.ok) {
+      let detail = "HTTP " + resp.status;
+      try { detail = (await resp.json()).detail || detail; } catch (_) {}
+      const kind = resp.status === 503 ? "warn" : "err";
+      msg(kind, `请求未成功（${resp.status}）：\n${detail}`);
+      prog.hidden = true;
+      return;
+    }
+    // 流式接收，展示下载进度（含取档等待 + CSV 生成）。
+    const total = Number(resp.headers.get("content-length")) || 0;
+    const reader = resp.body.getReader();
+    const chunks = []; let got = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      if (total) prog.value = Math.min(99, got / total * 100);
+    }
+    const blob = new Blob(chunks, { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const dispo = resp.headers.get("content-disposition") || "";
+    const m = dispo.match(/filename="?([^"]+)"?/);
+    a.href = url; a.download = m ? m[1] : "export.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+    prog.value = 100;
+    msg("ok", `CSV 已生成并下载（${fmtBytes(got)}）。版本 ETag：${resp.headers.get("x-cache-etag") || "?"}\n服务实例：${resp.headers.get("x-served-by") || "?"}`);
+    loadCache();
+  } catch (e) {
+    msg("err", "查询失败：" + e + "\n（若为主动取消/断连，本次租用会被自动释放）");
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { prog.hidden = true; }, 1500);
+  }
+};
+
+loadCatalog();
+loadCache();
+setInterval(loadCache, 3000);
+</script>
+</body>
+</html>
